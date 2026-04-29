@@ -1,0 +1,14 @@
+# ServiceAccount for Grafana Alloy
+# Alloy membutuhkan akses ke Kubernetes API untuk pod/log discovery,
+# sehingga perlu ClusterRole (lihat rbac.yaml).
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy-sa
+  namespace: alloy
+  labels:
+    app.kubernetes.io/name:      alloy
+    app.kubernetes.io/component: serviceaccount
+# automountServiceAccountToken diset true agar alloy bisa akses k8s API via RBAC
+automountServiceAccountToken: true

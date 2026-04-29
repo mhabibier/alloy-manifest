@@ -1,0 +1,69 @@
+# Services for Grafana Alloy
+#
+# 1. ClusterIP — microservice mengirim OTLP traces ke Alloy (internal)
+# 2. NodePort  — akses Alloy UI + OTLP dari luar cluster jika diperlukan
+#
+# Microservice menggunakan:
+#   OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy.alloy.svc.cluster.local:4317
+#
+# NodePort mapping:
+#   4317 (OTLP gRPC) → 30317
+#   4318 (OTLP HTTP) → 30318
+#   12345 (Alloy UI) → 30345
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy
+  namespace: alloy
+  labels:
+    app.kubernetes.io/name:      alloy
+    app.kubernetes.io/component: collector
+spec:
+  type: ClusterIP
+  selector:
+    app: alloy
+  ports:
+    - name:       otlp-grpc
+      port:       4317
+      targetPort: otlp-grpc
+      protocol:   TCP
+    - name:       otlp-http
+      port:       4318
+      targetPort: otlp-http
+      protocol:   TCP
+    - name:       ui
+      port:       12345
+      targetPort: ui
+      protocol:   TCP
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy-np
+  namespace: alloy
+  labels:
+    app.kubernetes.io/name:      alloy
+    app.kubernetes.io/component: collector-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: alloy
+  ports:
+    - name:       otlp-grpc
+      port:       4317
+      targetPort: otlp-grpc
+      protocol:   TCP
+      nodePort:   30317   # OTLP gRPC dari luar cluster
+    - name:       otlp-http
+      port:       4318
+      targetPort: otlp-http
+      protocol:   TCP
+      nodePort:   30318   # OTLP HTTP dari luar cluster
+    - name:       ui
+      port:       12345
+      targetPort: ui
+      protocol:   TCP
+      nodePort:   30345   # Alloy UI: http://<node-ip>:30345

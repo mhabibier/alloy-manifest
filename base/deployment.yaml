@@ -1,0 +1,111 @@
+# Deployment for Grafana Alloy
+# Alloy di Kubernetes membaca log dari node host path /var/log/pods
+# sehingga membutuhkan hostPath volume (read-only).
+# Jalankan sebagai DaemonSet jika ingin log dari semua node,
+# atau Deployment (1 replica) jika cluster single-node.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alloy
+  namespace: alloy
+  labels:
+    app.kubernetes.io/name:      alloy
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/version:   "v1.3.1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alloy
+  template:
+    metadata:
+      labels:
+        app: alloy
+        app.kubernetes.io/name:      alloy
+        app.kubernetes.io/component: collector
+    spec:
+      serviceAccountName: alloy-sa
+      automountServiceAccountToken: true   # diperlukan untuk k8s API discovery
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+        - name: harbor-secret
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.3.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - run
+            - /etc/alloy/config.alloy
+            - --server.http.listen-addr=0.0.0.0:12345
+            - --stability.level=public-preview
+          ports:
+            - name:          otlp-grpc
+              containerPort: 4317
+              protocol:      TCP
+            - name:          otlp-http
+              containerPort: 4318
+              protocol:      TCP
+            - name:          ui
+              containerPort: 12345
+              protocol:      TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem:   false
+            # Alloy perlu akses ke host log files
+            # runAsNonRoot tidak di-set agar bisa baca /var/log/pods
+          startupProbe:
+            httpGet:
+              path: /-/ready
+              port: ui
+            initialDelaySeconds: 10
+            periodSeconds:       5
+            failureThreshold:    12
+            timeoutSeconds:      3
+          livenessProbe:
+            httpGet:
+              path: /-/ready
+              port: ui
+            initialDelaySeconds: 0
+            periodSeconds:       30
+            timeoutSeconds:      5
+            failureThreshold:    3
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: ui
+            initialDelaySeconds: 0
+            periodSeconds:       10
+            timeoutSeconds:      3
+            failureThreshold:    3
+            successThreshold:    1
+          resources:
+            requests:
+              cpu:    "100m"
+              memory: "256Mi"
+            limits:
+              cpu:    "1000m"
+              memory: "512Mi"
+          volumeMounts:
+            - name:      config
+              mountPath: /etc/alloy/config.alloy
+              subPath:   config.alloy
+              readOnly:  true
+            - name:      pod-logs
+              mountPath: /var/log/pods
+              readOnly:  true   # Baca log dari node (read-only)
+            - name:      tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: alloy-config
+        - name: pod-logs
+          hostPath:
+            path: /var/log/pods   # Mount log directory dari node host
+            type: Directory
+        - name: tmp
+          emptyDir: {}

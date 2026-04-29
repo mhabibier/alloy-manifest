@@ -1,0 +1,49 @@
+# RBAC for Grafana Alloy
+#
+# Alloy membutuhkan akses ke Kubernetes API untuk:
+# - Discover pods (discovery.kubernetes)
+# - Baca logs dari node (loki.source.kubernetes_logs)
+# - Akses ke namespace, pods, nodes untuk relabeling
+#
+# ClusterRole diberikan agar Alloy bisa akses semua namespace.
+
+# ── ClusterRole ───────────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alloy-clusterrole
+  labels:
+    app.kubernetes.io/name:      alloy
+    app.kubernetes.io/component: rbac
+rules:
+  # Akses ke pod metadata untuk discovery
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "nodes", "nodes/proxy", "services", "endpoints", "namespaces"]
+    verbs:     ["get", "list", "watch"]
+  # Akses ke events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs:     ["get", "list", "watch"]
+  # Akses untuk Kubernetes log source
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
+    verbs:     ["get", "list", "watch"]
+
+---
+
+# ── ClusterRoleBinding ────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alloy-clusterrolebinding
+  labels:
+    app.kubernetes.io/name:      alloy
+    app.kubernetes.io/component: rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind:     ClusterRole
+  name:     alloy-clusterrole
+subjects:
+  - kind:      ServiceAccount
+    name:      alloy-sa
+    namespace: alloy
