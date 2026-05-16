@@ -1,8 +1,9 @@
 # ConfigMap for Grafana Alloy
 # Config disesuaikan untuk Kubernetes:
 # - Docker discovery diganti dengan Kubernetes pod discovery
-# - loki.source.docker diganti dengan loki.source.file (baca /var/log/pods/ dari node)
-# - OTLP exporter diarahkan ke Tempo service DNS di namespace tempo
+# - loki.source.file membaca /var/log/pods/ dari node host
+# - OTLP HTTP receiver (4318) untuk traces dari microservice (pakai OTLPTraceExporter proto-http)
+# - OTLP gRPC receiver (4317) juga tetap aktif untuk kompatibilitas
 # - Loki writer diarahkan ke Loki service DNS di namespace loki
 
 apiVersion: v1
@@ -20,6 +21,8 @@ data:
     // Mengumpulkan logs dari semua pod Kubernetes dan meneruskan ke Loki.
 
     // ── OTLP Receiver — menerima traces dari semua microservice ─────────────────
+    // Microservice menggunakan OTLPTraceExporter (proto-http) → url: endpoint/v1/traces
+    // Ini berarti mereka kirim ke port 4318 (HTTP), BUKAN 4317 (gRPC)
     otelcol.receiver.otlp "default" {
       grpc {
         endpoint = "0.0.0.0:4317"
@@ -36,7 +39,6 @@ data:
     // ── OTLP Exporter — forward traces ke Tempo ──────────────────────────────────
     otelcol.exporter.otlp "tempo" {
       client {
-        // Tempo Service DNS: tempo.tempo.svc.cluster.local
         endpoint = "tempo.tempo.svc.cluster.local:4317"
         tls {
           insecure = true
@@ -45,7 +47,6 @@ data:
     }
 
     // ── Kubernetes Pod Discovery ─────────────────────────────────────────────────
-    // Menggantikan discovery.docker (tidak tersedia di Kubernetes)
     discovery.kubernetes "pods" {
       role = "pod"
     }
@@ -54,10 +55,17 @@ data:
     discovery.relabel "pod_logs" {
       targets = discovery.kubernetes.pods.targets
 
-      // Hanya ambil pod yang running (bukan pending/completed)
+      // Hanya ambil pod yang running
       rule {
         source_labels = ["__meta_kubernetes_pod_phase"]
         regex         = "Pending|Succeeded|Failed"
+        action        = "drop"
+      }
+
+      // Drop pod yang punya annotation logging: "false"
+      rule {
+        source_labels = ["__meta_kubernetes_pod_annotation_logging"]
+        regex         = "false"
         action        = "drop"
       }
 
@@ -85,39 +93,33 @@ data:
         target_label  = "service_name"
       }
 
-      // Set path ke log file container di node
-      // Format path K8s: /var/log/pods/<namespace>_<pod-name>_<uid>/<container>/<n>.log
-      rule {
-        source_labels = [
-          "__meta_kubernetes_namespace",
-          "__meta_kubernetes_pod_name",
-          "__meta_kubernetes_pod_uid",
-          "__meta_kubernetes_pod_container_name",
-        ]
-        separator    = "|"
-        regex        = "([^|]+)|([^|]+)|([^|]+)|([^|]+)"
-        replacement  = "/var/log/pods/$1_$2_$3/$4/*.log"
-        target_label = "__path__"
-      }
-
       // Label node untuk debugging
       rule {
         source_labels = ["__meta_kubernetes_pod_node_name"]
         target_label  = "node"
       }
+
+      // Set path ke log file container di node
+      // Format path K8s: /var/log/pods/<namespace>_<pod-name>_<uid>/<container>/<n>.log
+      // Gunakan wildcard pada uid prefix untuk match direktori: *<uid>
+      rule {
+        source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+        separator     = "/"
+        target_label  = "__path__"
+        replacement   = "/var/log/pods/*$1/*.log"
+      }
     }
 
     // ── Kubernetes Log Source ────────────────────────────────────────────────────
-    // Membaca log files dari node via path __path__ yang di-set oleh discovery.relabel
-    // loki.source.file adalah komponen yang benar; loki.source.kubernetes_logs TIDAK ADA
+    // loki.source.file membaca log files dari node host via __path__ glob
     loki.source.file "pod_logs" {
       targets    = discovery.relabel.pod_logs.output
-      forward_to = [loki.process.parse_json.receiver]
+      forward_to = [loki.process.pod_logs.receiver]
     }
 
-    // ── Log Processing — parse JSON logs (Winston/Python structlog) ──────────────
-    loki.process "parse_json" {
-      // Parse setiap log line sebagai JSON
+    // ── Log Processing ───────────────────────────────────────────────────────────
+    loki.process "pod_logs" {
+      // Coba parse sebagai JSON — jika gagal, tetap lolos sebagai plain text
       stage.json {
         expressions = {
           level       = "level",
@@ -129,7 +131,7 @@ data:
         }
       }
 
-      // Promote parsed fields ke Loki stream labels
+      // Set label level jika berhasil di-parse dari JSON
       stage.labels {
         values = {
           level       = "",
@@ -143,7 +145,7 @@ data:
         values = ["level", "service", "environment", "namespace", "pod", "container", "service_name"]
       }
 
-      // Simpan trace_id & span_id sebagai structured metadata
+      // Simpan trace_id & span_id sebagai structured metadata (hanya jika ada)
       stage.structured_metadata {
         values = {
           trace_id = "trace_id",
@@ -157,7 +159,6 @@ data:
     // ── Loki Writer ──────────────────────────────────────────────────────────────
     loki.write "default" {
       endpoint {
-        // Loki Service DNS: loki.loki.svc.cluster.local
         url = "http://loki.loki.svc.cluster.local:3100/loki/api/v1/push"
       }
     }
