@@ -1,10 +1,11 @@
 # ConfigMap for Grafana Alloy
 # Config disesuaikan untuk Kubernetes:
-# - Docker discovery diganti dengan Kubernetes pod discovery
-# - loki.source.file membaca /var/log/pods/ dari node host
-# - OTLP HTTP receiver (4318) untuk traces dari microservice (pakai OTLPTraceExporter proto-http)
-# - OTLP gRPC receiver (4317) juga tetap aktif untuk kompatibilitas
-# - Loki writer diarahkan ke Loki service DNS di namespace loki
+# - loki.source.kubernetes menggantikan loki.source.file
+#   Membaca log langsung dari Kubernetes API (pods/log) — tidak butuh hostPath volume
+#   Tidak ada risiko permission/glob pattern/path issue
+# - OTLP HTTP receiver (4318) untuk traces dari microservice
+# - OTLP gRPC receiver (4317) juga aktif untuk kompatibilitas
+# - Loki writer diarahkan ke loki.loki.svc.cluster.local:3100
 
 apiVersion: v1
 kind: ConfigMap
@@ -16,13 +17,11 @@ metadata:
     app.kubernetes.io/component: config
 data:
   config.alloy: |
-    // Grafana Alloy — Kubernetes adaptation
-    // Menerima OTLP traces dari semua microservice dan meneruskan ke Tempo.
-    // Mengumpulkan logs dari semua pod Kubernetes dan meneruskan ke Loki.
+    // Grafana Alloy — Kubernetes
+    // - Traces: OTLP HTTP/gRPC → Tempo
+    // - Logs:   Kubernetes API (loki.source.kubernetes) → Loki
 
-    // ── OTLP Receiver — menerima traces dari semua microservice ─────────────────
-    // Microservice menggunakan OTLPTraceExporter (proto-http) → url: endpoint/v1/traces
-    // Ini berarti mereka kirim ke port 4318 (HTTP), BUKAN 4317 (gRPC)
+    // ── OTLP Receiver ────────────────────────────────────────────────────────────
     otelcol.receiver.otlp "default" {
       grpc {
         endpoint = "0.0.0.0:4317"
@@ -30,13 +29,12 @@ data:
       http {
         endpoint = "0.0.0.0:4318"
       }
-
       output {
         traces = [otelcol.exporter.otlp.tempo.input]
       }
     }
 
-    // ── OTLP Exporter — forward traces ke Tempo ──────────────────────────────────
+    // ── OTLP Exporter → Tempo ─────────────────────────────────────────────────
     otelcol.exporter.otlp "tempo" {
       client {
         endpoint = "tempo.tempo.svc.cluster.local:4317"
@@ -51,75 +49,68 @@ data:
       role = "pod"
     }
 
-    // Relabel: filter dan map pod metadata ke Loki labels
+    // ── Relabel: filter dan map metadata ke Loki labels ──────────────────────────
     discovery.relabel "pod_logs" {
       targets = discovery.kubernetes.pods.targets
 
-      // Hanya ambil pod yang running
+      // Drop pod yang tidak Running
       rule {
         source_labels = ["__meta_kubernetes_pod_phase"]
-        regex         = "Pending|Succeeded|Failed"
+        regex         = "Pending|Succeeded|Failed|Unknown"
         action        = "drop"
       }
 
-      // Drop pod yang punya annotation logging: "false"
+      // Drop pod tanpa container name (edge case)
       rule {
-        source_labels = ["__meta_kubernetes_pod_annotation_logging"]
-        regex         = "false"
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        regex         = ""
         action        = "drop"
       }
 
-      // Namespace sebagai label
+      // Label: namespace
       rule {
         source_labels = ["__meta_kubernetes_namespace"]
         target_label  = "namespace"
       }
 
-      // Nama pod
+      // Label: pod name
       rule {
         source_labels = ["__meta_kubernetes_pod_name"]
         target_label  = "pod"
       }
 
-      // Nama container dalam pod
+      // Label: container name
       rule {
         source_labels = ["__meta_kubernetes_pod_container_name"]
         target_label  = "container"
       }
 
-      // Label app (dari pod labels: app=xxx)
+      // Label: service_name dari pod label app=xxx
       rule {
         source_labels = ["__meta_kubernetes_pod_label_app"]
         target_label  = "service_name"
       }
 
-      // Label node untuk debugging
+      // Label: node
       rule {
         source_labels = ["__meta_kubernetes_pod_node_name"]
         target_label  = "node"
       }
-
-      // Set path ke log file container di node
-      // Format path K8s: /var/log/pods/<namespace>_<pod-name>_<uid>/<container>/<n>.log
-      // Gunakan wildcard pada uid prefix untuk match direktori: *<uid>
-      rule {
-        source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
-        separator     = "/"
-        target_label  = "__path__"
-        replacement   = "/var/log/pods/*$1/*.log"
-      }
     }
 
-    // ── Kubernetes Log Source ────────────────────────────────────────────────────
-    // loki.source.file membaca log files dari node host via __path__ glob
-    loki.source.file "pod_logs" {
+    // ── Log Source via Kubernetes API ─────────────────────────────────────────────
+    // loki.source.kubernetes membaca log langsung dari Kubernetes API (pods/log endpoint)
+    // TIDAK membutuhkan: hostPath volume, __path__ glob, akses filesystem node
+    // Keuntungan: lebih simpel, reliable, tidak ada masalah permission/path
+    loki.source.kubernetes "pod_logs" {
       targets    = discovery.relabel.pod_logs.output
       forward_to = [loki.process.pod_logs.receiver]
     }
 
     // ── Log Processing ───────────────────────────────────────────────────────────
     loki.process "pod_logs" {
-      // Coba parse sebagai JSON — jika gagal, tetap lolos sebagai plain text
+      // Coba parse sebagai JSON (Winston/structlog format)
+      // Jika bukan JSON, log tetap lolos sebagai plain text
       stage.json {
         expressions = {
           level       = "level",
@@ -131,7 +122,7 @@ data:
         }
       }
 
-      // Set label level jika berhasil di-parse dari JSON
+      // Promote extracted fields ke Loki stream labels
       stage.labels {
         values = {
           level       = "",
@@ -140,12 +131,12 @@ data:
         }
       }
 
-      // Hanya simpan label yang dibutuhkan (hindari high-cardinality)
+      // Simpan hanya label yang dibutuhkan
       stage.label_keep {
         values = ["level", "service", "environment", "namespace", "pod", "container", "service_name"]
       }
 
-      // Simpan trace_id & span_id sebagai structured metadata (hanya jika ada)
+      // trace_id & span_id sebagai structured metadata (kosong = skip)
       stage.structured_metadata {
         values = {
           trace_id = "trace_id",
@@ -156,7 +147,7 @@ data:
       forward_to = [loki.write.default.receiver]
     }
 
-    // ── Loki Writer ──────────────────────────────────────────────────────────────
+    // ── Loki Writer ───────────────────────────────────────────────────────────────
     loki.write "default" {
       endpoint {
         url = "http://loki.loki.svc.cluster.local:3100/loki/api/v1/push"

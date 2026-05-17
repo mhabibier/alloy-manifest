@@ -1,8 +1,7 @@
 # Deployment for Grafana Alloy
-# Alloy di Kubernetes membaca log dari node host path /var/log/pods
-# sehingga membutuhkan hostPath volume (read-only).
-# Jalankan sebagai DaemonSet jika ingin log dari semua node,
-# atau Deployment (1 replica) jika cluster single-node.
+# loki.source.kubernetes membaca log dari Kubernetes API — tidak butuh hostPath volume.
+# Alloy hanya butuh: config volume + tmp.
+# Jalankan sebagai DaemonSet jika cluster multi-node.
 
 apiVersion: apps/v1
 kind: Deployment
@@ -92,18 +91,11 @@ spec:
               mountPath: /etc/alloy/config.alloy
               subPath:   config.alloy
               readOnly:  true
-            - name:      pod-logs
-              mountPath: /var/log/pods
-              readOnly:  true   # Baca log dari node (read-only)
             - name:      tmp
               mountPath: /tmp
       volumes:
         - name: config
           configMap:
             name: alloy-config
-        - name: pod-logs
-          hostPath:
-            path: /var/log/pods   # Mount log directory dari node host
-            type: Directory
         - name: tmp
           emptyDir: {}
