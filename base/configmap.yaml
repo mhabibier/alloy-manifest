@@ -99,17 +99,24 @@ data:
     }
 
     // ── Log Source via Kubernetes API ─────────────────────────────────────────────
-    // loki.source.kubernetes membaca log langsung dari Kubernetes API (pods/log endpoint)
-    // tail_from_end = true: hanya baca log BARU (bukan semua log sejak pod start)
-    // Mencegah error "timestamp too old" dari Loki
+    // loki.source.kubernetes membaca log dari Kubernetes API (pods/log endpoint)
+    // Tidak butuh hostPath volume, tidak ada masalah permission/path
     loki.source.kubernetes "pod_logs" {
-      targets       = discovery.relabel.pod_logs.output
-      forward_to    = [loki.process.pod_logs.receiver]
-      tail_from_end = true
+      targets    = discovery.relabel.pod_logs.output
+      forward_to = [loki.process.pod_logs.receiver]
     }
 
     // ── Log Processing ───────────────────────────────────────────────────────────
     loki.process "pod_logs" {
+      // Drop log entry yang lebih tua dari 24 jam
+      // Mencegah error "timestamp too old" dari Loki (limit: 168h)
+      // loki.source.kubernetes membaca dari awal pod saat pertama start;
+      // stage.drop membuang log lama sebelum dikirim ke Loki
+      stage.drop {
+        older_than          = "24h"
+        drop_counter_reason = "too_old"
+      }
+
       // Coba parse sebagai JSON (Winston/structlog format)
       // Jika bukan JSON, log tetap lolos sebagai plain text
       stage.json {
